@@ -27,8 +27,8 @@ class PDFChatbot:
         
         print("Splitting documents into chunks...")
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=500,  # Smaller chunks for better precision
-            chunk_overlap=100,  # More overlap for context continuity
+            chunk_size=1000,  # Smaller chunks for better precision
+            chunk_overlap=200,  # More overlap for context continuity
             length_function=len,
             separators=["\n\n", "\n", ". ", " ", ""]
         )
@@ -81,7 +81,7 @@ class PDFChatbot:
     def setup_rag_chain(self):
         """Setup RAG chain with OpenAI LLM using LCEL"""
         llm = ChatOpenAI(
-            model="gpt-3.5-turbo",
+            model="gpt-4o-mini",
             temperature=0,
             openai_api_key=os.getenv("OPENAI_API_KEY")
         )

@@ -57,12 +57,15 @@ async def upload_pdf_tool(file_path: str) -> str:
     if response.status_code != 200:
         return f"Failed to upload PDF: {response.text}"
 
-    return "The PDF has been uploaded successfully. I am now ready to answer questions from it."
+    return (
+        "The PDF has been uploaded successfully. "
+        "I am now ready to answer questions strictly from this document."
+    )
 
 
 @function_tool(
     name="query_pdf",
-    description="Ask a question about the uploaded PDF document"
+    description="Ask a question about the uploaded PDF document and return the exact answer from it"
 )
 async def query_pdf_tool(question: str) -> str:
     async with httpx.AsyncClient(timeout=120) as client:
@@ -74,6 +77,7 @@ async def query_pdf_tool(question: str) -> str:
     if response.status_code != 200:
         return f"Failed to query the document: {response.text}"
 
+    # IMPORTANT: return backend answer EXACTLY
     return response.json()["answer"]
 
 
@@ -85,19 +89,28 @@ class Assistant(Agent):
     def __init__(self) -> None:
         super().__init__(
             instructions="""
-You are a helpful voice assistant.
+You are a voice assistant with document-grounded answering.
 
-You can:
-- Have normal conversations
-- Help users upload a PDF
-- Answer questions from an uploaded PDF
+GENERAL MODE:
+- You can chat normally when the user is not asking about a document.
 
-IMPORTANT RULES:
-1. If the user asks about a document, FIRST check document status.
-2. If no document exists, tell the user to upload one.
-3. If a document exists, ALWAYS use the query_pdf tool.
-4. Never answer document questions from general knowledge.
-5. Be concise and natural.
+DOCUMENT MODE (VERY IMPORTANT):
+- When the user asks anything about the uploaded PDF:
+  1. First check if a document exists.
+  2. If it exists, ALWAYS call query_pdf.
+  3. The output of query_pdf IS THE FINAL ANSWER.
+
+CRITICAL RULES:
+- NEVER rephrase, summarize, or expand the output of query_pdf.
+- Speak the query_pdf result EXACTLY as returned.
+- Do NOT add explanations, context, or opinions.
+- Do NOT answer document questions from your own knowledge.
+- If the document does not contain the answer, say exactly what the tool returns.
+
+If no document exists:
+- Ask the user to upload a PDF first.
+
+Speak naturally, but remain strictly faithful to the document.
 """,
             tools=[
                 check_document_status_tool,
@@ -117,9 +130,9 @@ server = AgentServer()
 @server.rtc_session()
 async def my_agent(ctx: agents.JobContext):
     session = AgentSession(
-        stt="assemblyai/universal-streaming:en",
+        stt="deepgram/nova-2:en",
         llm="openai/gpt-4.1-mini",
-        tts="cartesia/sonic-3:9626c31c-bec5-4cca-baa8-f8ba9e84c8bc",
+        tts="elevenlabs/eleven_turbo_v2_5:iP95p4xoKVk53GoZ742B",
         vad=silero.VAD.load(),
         turn_detection=MultilingualModel(),
     )
@@ -142,7 +155,7 @@ async def my_agent(ctx: agents.JobContext):
     await session.generate_reply(
         instructions=(
             "Hello. You can chat with me normally, "
-            "or upload a PDF and ask questions from it."
+            "or upload a PDF and ask questions strictly from its content."
         )
     )
 
