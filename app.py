@@ -1,144 +1,156 @@
 import os
+import hashlib
+import shutil
+import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from pydantic import BaseModel
-from langchain_community.document_loaders import PyPDFLoader
+
+from langchain_community.document_loaders import (
+    PyPDFLoader,
+    TextLoader,
+    Docx2txtLoader
+)
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_openai import OpenAIEmbeddings
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import Chroma
-from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
-import shutil
-import uvicorn
 
 load_dotenv(".env")
 
-# Global variable to store the chatbot instance
+# Global chatbot instance (per uploaded file)
 chatbot_instance = None
 
-# ==================== RAG Components ====================
+# ==================== RAG COMPONENT ====================
 
 class PDFChatbot:
-    def __init__(self, pdf_path):
-        self.pdf_path = pdf_path
+    def __init__(self, file_path: str):
+        self.file_path = file_path
+
+        # 🔑 Unique ID per file
+        self.pdf_id = hashlib.md5(file_path.encode()).hexdigest()
+
         self.vectorstore = None
-        self.rag_chain = None
         self.retriever = None
-        
+        self.rag_chain = None
+
     def load_and_process_pdf(self):
-        """Load PDF and split into chunks"""
-        print("Loading PDF...")
-        loader = PyPDFLoader(self.pdf_path)
+        print("Loading document...")
+
+        ext = os.path.splitext(self.file_path)[1].lower()
+
+        if ext == ".pdf":
+            loader = PyPDFLoader(self.file_path)
+        elif ext == ".txt":
+            loader = TextLoader(self.file_path, encoding="utf-8")
+        elif ext in [".docx", ".doc"]:
+            loader = Docx2txtLoader(self.file_path)
+        else:
+            raise ValueError("Unsupported file type")
+
         documents = loader.load()
-        
+
         print("Splitting documents into chunks...")
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200,
-            length_function=len,
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=2000,
+            chunk_overlap=500,
             separators=["\n\n", "\n", ". ", " ", ""]
         )
-        chunks = text_splitter.split_documents(documents)
+
+        chunks = splitter.split_documents(documents)
+
+        # 🔑 Attach metadata for filtering
+        for chunk in chunks:
+            chunk.metadata["pdf_id"] = self.pdf_id
+            chunk.metadata["source_file"] = os.path.basename(self.file_path)
+
         print(f"Created {len(chunks)} chunks")
-        
         return chunks
-    
+
     def create_vectorstore(self, chunks):
-        """Create vector store with embeddings"""
         print("Creating embeddings...")
         embeddings = OpenAIEmbeddings(
             model="text-embedding-3-small",
             openai_api_key=os.getenv("OPENAI_API_KEY")
         )
-        
-        print("Building vector store...")
-        self.vectorstore = Chroma.from_documents(
-            documents=chunks,
-            embedding=embeddings,
-            persist_directory="./chroma_db"
+
+        print("Loading / updating shared vector store...")
+        self.vectorstore = Chroma(
+            persist_directory="./chroma_db",
+            embedding_function=embeddings
         )
-        
+
+        self.vectorstore.add_documents(chunks)
+        self.vectorstore.persist()
+
         self.retriever = self.vectorstore.as_retriever(
             search_type="mmr",
             search_kwargs={
                 "k": 5,
                 "fetch_k": 10,
-                "lambda_mult": 0.7
+                "lambda_mult": 0.7,
+                "filter": {"pdf_id": self.pdf_id}
             }
         )
-        print("Vector store created successfully!")
-    
-    def format_docs(self, docs):
-        """Format retrieved documents with metadata"""
-        formatted = []
-        for i, doc in enumerate(docs, 1):
-            page_num = doc.metadata.get('page', 'Unknown')
-            content = doc.page_content.strip()
-            formatted.append(f"[Source {i} - Page {page_num}]\n{content}")
-        return "\n\n".join(formatted)
-    
-    def retrieve_context(self, question):
-        """Retrieve and format context for the question"""
+
+        print("Vector store ready (metadata filtering enabled).")
+
+    def retrieve_context(self, question: str) -> str:
         docs = self.retriever.invoke(question)
-        return self.format_docs(docs)
-    
+        return "\n\n".join(
+            f"[{d.metadata.get('source_file')}]\n{d.page_content.strip()}"
+            for d in docs
+        )
+
     def setup_rag_chain(self):
-        """Setup RAG chain with OpenAI LLM using LCEL"""
-        llm_model = ChatOpenAI(
+        llm = ChatOpenAI(
             model="gpt-4o-mini",
             temperature=0,
             openai_api_key=os.getenv("OPENAI_API_KEY")
         )
-        
-        template = """You are a helpful voice assistant that answers questions based on the provided context from a PDF document.
 
-Context from the document:
+        template = """You are a helpful voice assistant that answers questions strictly using the provided document context.
+
+Context:
 {context}
 
-Question: {question}
+Question:
+{question}
 
-Instructions:
-- Answer the question based ONLY on the information provided in the context above
-- If the context contains relevant information, provide a detailed answer
-- If the context doesn't contain enough information to answer the question, say "I don't have enough information in the document to answer this question"
-- Keep your response concise and conversational for voice interaction
-- Avoid complex formatting, just speak naturally
+Rules:
+- Use ONLY the context above
+- If the answer is not in the context, say:
+  "I don't have enough information in the document to answer this question."
+- Keep the answer concise and conversational
 
 Answer:"""
-        
+
         prompt = ChatPromptTemplate.from_template(template)
-        
+
         self.rag_chain = (
             {
-                "context": lambda x: self.retrieve_context(x),
+                "context": lambda q: self.retrieve_context(q),
                 "question": RunnablePassthrough()
             }
             | prompt
-            | llm_model
+            | llm
             | StrOutputParser()
         )
-    
+
     def initialize(self):
-        """Initialize the chatbot"""
         chunks = self.load_and_process_pdf()
         self.create_vectorstore(chunks)
         self.setup_rag_chain()
-        print("\nChatbot initialized!")
-    
-    def ask_question(self, question):
-        """Ask a question about the PDF"""
-        if not self.rag_chain:
-            return "Please initialize the chatbot first!"
-        
-        response = self.rag_chain.invoke(question)
-        return response
+        print("✅ Chatbot initialized for this document.")
 
+    def ask_question(self, question: str) -> str:
+        return self.rag_chain.invoke(question)
 
-# ==================== FastAPI Application ====================
+# ==================== FASTAPI APP ====================
 
-app = FastAPI(title="PDF RAG Chatbot API")
+app = FastAPI(title="Document RAG Chatbot API")
 
 class QueryRequest(BaseModel):
     query: str
@@ -154,70 +166,72 @@ class UploadResponse(BaseModel):
 
 @app.post("/upload-pdf", response_model=UploadResponse)
 async def upload_pdf(file: UploadFile = File(...)):
-    """Upload a PDF file and initialize the RAG chatbot"""
     global chatbot_instance
-    
-    if not file.filename.endswith('.pdf'):
-        raise HTTPException(status_code=400, detail="Only PDF files are allowed")
-    
+
+    allowed_extensions = (".pdf", ".txt", ".docx", ".doc")
+
+    if not file.filename.lower().endswith(allowed_extensions):
+        raise HTTPException(
+            status_code=400,
+            detail="Only PDF, TXT, DOCX, and DOC files are allowed"
+        )
+
     upload_dir = "./uploaded_pdfs"
     os.makedirs(upload_dir, exist_ok=True)
     file_path = os.path.join(upload_dir, file.filename)
-    
+
     try:
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
-        
+
         chatbot_instance = PDFChatbot(file_path)
         chatbot_instance.initialize()
-        
+
         return UploadResponse(
-            message="PDF uploaded and processed successfully",
+            message="File uploaded and processed successfully",
             filename=file.filename
         )
-    
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/query", response_model=QueryResponse)
 async def query_pdf(request: QueryRequest):
-    """Query the uploaded PDF document"""
     global chatbot_instance
-    
+
     if chatbot_instance is None:
         raise HTTPException(
             status_code=400,
-            detail="No PDF uploaded. Please upload a PDF first using /upload-pdf endpoint"
+            detail="No file uploaded. Please upload a file first using /upload-pdf"
         )
-    
-    if not request.query or request.query.strip() == "":
+
+    if not request.query.strip():
         raise HTTPException(status_code=400, detail="Query cannot be empty")
-    
+
     try:
         answer = chatbot_instance.ask_question(request.query)
         return QueryResponse(answer=answer, query=request.query)
-    
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing query: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/")
 async def root():
-    """Root endpoint - API information"""
     return {
-        "message": "PDF RAG Chatbot API",
+        "message": "Document RAG Chatbot API",
         "endpoints": {
-            "/upload-pdf": "POST - Upload a PDF file",
-            "/query": "POST - Query the uploaded PDF",
-            "/docs": "GET - API documentation"
+            "/upload-pdf": "POST",
+            "/query": "POST",
+            "/health": "GET",
+            "/docs": "Swagger UI"
         }
     }
 
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
     return {
         "status": "healthy",
         "chatbot_initialized": chatbot_instance is not None
@@ -225,6 +239,4 @@ async def health_check():
 
 
 if __name__ == "__main__":
-    print("Starting FastAPI server on http://localhost:8000")
-    print("Upload PDFs via: http://localhost:8000/docs")
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")

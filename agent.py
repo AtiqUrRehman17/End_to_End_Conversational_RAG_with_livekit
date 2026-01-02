@@ -1,5 +1,6 @@
 import os
 import httpx
+import asyncio
 from dotenv import load_dotenv
 
 from livekit import agents, rtc
@@ -16,7 +17,6 @@ from livekit.plugins.turn_detector.multilingual import MultilingualModel
 load_dotenv(".env")
 
 RAG_API_BASE = "http://localhost:8000"
-
 
 # =========================
 # TOOLS
@@ -77,7 +77,6 @@ async def query_pdf_tool(question: str) -> str:
     if response.status_code != 200:
         return f"Failed to query the document: {response.text}"
 
-    # IMPORTANT: return backend answer EXACTLY
     return response.json()["answer"]
 
 
@@ -89,14 +88,17 @@ class Assistant(Agent):
     def __init__(self) -> None:
         super().__init__(
             instructions="""
-You are a voice assistant with document-grounded answering.
+You are a friendly, professional voice assistant designed to help users in multiple ways.
 
 GENERAL MODE:
-- You can chat normally when the user is not asking about a document.
+- You can chat normally and answer general questions.
+- Be polite, welcoming, and conversational.
+- Clearly explain that you can help with questions, guidance, and documents.
 
 DOCUMENT MODE (VERY IMPORTANT):
-- When the user asks anything about the uploaded PDF:
-  1. First check if a document exists.
+- Users may upload documents such as PDF, TXT, DOC, or DOCX files.
+- When the user asks anything related to an uploaded document:
+  1. First check whether a document exists.
   2. If it exists, ALWAYS call query_pdf.
   3. The output of query_pdf IS THE FINAL ANSWER.
 
@@ -104,13 +106,13 @@ CRITICAL RULES:
 - NEVER rephrase, summarize, or expand the output of query_pdf.
 - Speak the query_pdf result EXACTLY as returned.
 - Do NOT add explanations, context, or opinions.
-- Do NOT answer document questions from your own knowledge.
+- Do NOT answer document-related questions from your own knowledge.
 - If the document does not contain the answer, say exactly what the tool returns.
 
-If no document exists:
-- Ask the user to upload a PDF first.
+If no document exists and the user asks about a document:
+- Politely ask the user to upload a document first.
 
-Speak naturally, but remain strictly faithful to the document.
+Always speak naturally, confidently, and in a friendly manner.
 """,
             tools=[
                 check_document_status_tool,
@@ -126,15 +128,15 @@ Speak naturally, but remain strictly faithful to the document.
 
 server = AgentServer()
 
-
 @server.rtc_session()
 async def my_agent(ctx: agents.JobContext):
     session = AgentSession(
         stt="deepgram/nova-2:en",
         llm="openai/gpt-4.1-mini",
-        tts="elevenlabs/eleven_turbo_v2_5:iP95p4xoKVk53GoZ742B",
+        tts="elevenlabs/eleven_turbo_v2_5:cgSgspJ2msm6clMCkdW9",
         vad=silero.VAD.load(),
         turn_detection=MultilingualModel(),
+        allow_interruptions=True,   # ✅ THIS IS THE KEY FIX
     )
 
     await session.start(
@@ -152,12 +154,16 @@ async def my_agent(ctx: agents.JobContext):
         ),
     )
 
-    await session.generate_reply(
+    # Initial greeting (NO asyncio.create_task)
+    session.generate_reply(
         instructions=(
-            "Hello. You can chat with me normally, "
-            "or upload a PDF and ask questions strictly from its content."
+            "Hello sir, I am here to help you 😊 "
+            "You can ask me any general questions, "
+            "or I can help you work with files such as PDF, TXT, DOC, or DOCX. "
+            "Please let me know how I can assist you today."
         )
     )
+
 
 
 if __name__ == "__main__":
