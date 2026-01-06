@@ -19,112 +19,114 @@ load_dotenv(".env")
 RAG_API_BASE = "http://localhost:8000"
 
 # =========================
-# SAFE HTTP CALLS
-# =========================
-async def safe_call(coro_fn, fallback: str):
-    try:
-        return await asyncio.wait_for(coro_fn(), timeout=60)
-    except Exception:
-        return fallback
-
-
-# =========================
 # TOOLS
 # =========================
+
 @function_tool(
     name="check_document_status",
-    description="Check whether a document has been uploaded"
+    description="Check whether a PDF document has been uploaded"
 )
 async def check_document_status_tool() -> str:
-    async def call():
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(f"{RAG_API_BASE}/health")
-            data = r.json()
-            return (
-                "Document is uploaded and ready."
-                if data.get("chatbot_initialized")
-                else "No document uploaded."
-            )
-    return await safe_call(call, "Unable to check document status.")
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.get(f"{RAG_API_BASE}/health")
+
+    if response.status_code != 200:
+        return "Unable to check document status."
+
+    data = response.json()
+    return (
+        "Document is uploaded and ready."
+        if data.get("chatbot_initialized")
+        else "No document uploaded."
+    )
 
 
 @function_tool(
     name="upload_pdf",
-    description="Upload a PDF file"
+    description="Upload a PDF file so the assistant can answer questions from it"
 )
 async def upload_pdf_tool(file_path: str) -> str:
     if not os.path.exists(file_path):
         return "The file path does not exist."
 
-    async def call():
-        async with httpx.AsyncClient(timeout=120) as client:
-            with open(file_path, "rb") as f:
-                files = {"file": (os.path.basename(file_path), f)}
-                await client.post(f"{RAG_API_BASE}/upload-pdf", files=files)
-        return "PDF uploaded successfully."
-    return await safe_call(call, "Failed to upload PDF.")
+    async with httpx.AsyncClient(timeout=120) as client:
+        with open(file_path, "rb") as f:
+            files = {"file": (os.path.basename(file_path), f, "application/pdf")}
+            response = await client.post(f"{RAG_API_BASE}/upload-pdf", files=files)
+
+    if response.status_code != 200:
+        return f"Failed to upload PDF: {response.text}"
+
+    return (
+        "The PDF has been uploaded successfully. "
+        "I am now ready to answer questions strictly from this document."
+    )
 
 
 @function_tool(
     name="query_pdf",
-    description="Query the uploaded document"
+    description="Ask a question about the uploaded PDF document and return the exact answer from it"
 )
 async def query_pdf_tool(question: str) -> str:
-    async def call():
-        async with httpx.AsyncClient(timeout=120) as client:
-            r = await client.post(
-                f"{RAG_API_BASE}/query",
-                json={"query": question}
-            )
-            return r.json()["answer"]
-    return await safe_call(call, "No answer found in the document.")
+    async with httpx.AsyncClient(timeout=120) as client:
+        response = await client.post(
+            f"{RAG_API_BASE}/query",
+            json={"query": question}
+        )
+
+    if response.status_code != 200:
+        return f"Failed to query the document: {response.text}"
+
+    return response.json()["answer"]
 
 
 # =========================
 # AGENT
 # =========================
+
 class Assistant(Agent):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__(
             instructions="""
-You are a friendly professional assistant.
+You are a friendly, professional voice assistant designed to help users in multiple ways.
 
-- Answer general questions normally.
-- If the user asks about a document:
-  ALWAYS call query_pdf.
-  Speak EXACTLY what query_pdf returns.
+GENERAL MODE:
+- You can chat normally and answer general questions.
+- Be polite, welcoming, and conversational.
+- Clearly explain that you can help with questions, guidance, and documents.
+
+DOCUMENT MODE (VERY IMPORTANT):
+- Users may upload documents such as PDF, TXT, DOC, or DOCX files.
+- When the user asks anything related to an uploaded document:
+  1. First check whether a document exists.
+  2. If it exists, ALWAYS call query_pdf.
+  3. The output of query_pdf IS THE FINAL ANSWER.
+
+CRITICAL RULES:
+- NEVER rephrase, summarize, or expand the output of query_pdf.
+- Speak the query_pdf result EXACTLY as returned.
+- Do NOT add explanations, context, or opinions.
+- Do NOT answer document-related questions from your own knowledge.
+- If the document does not contain the answer, say exactly what the tool returns.
+
+If no document exists and the user asks about a document:
+- Politely ask the user to upload a document first.
+
+Always speak naturally, confidently, and in a friendly manner.
 """,
             tools=[
                 check_document_status_tool,
                 upload_pdf_tool,
                 query_pdf_tool,
-            ]
+            ],
         )
 
 
 # =========================
 # LIVEKIT SESSION
 # =========================
+
 server = AgentServer()
-
-# Helper to split long text for TTS
-def chunk_text(text, max_chars=400):
-    words = text.split()
-    chunks = []
-    current = []
-    count = 0
-    for w in words:
-        count += len(w) + 1
-        if count > max_chars:
-            chunks.append(" ".join(current))
-            current = [w]
-            count = len(w) + 1
-        else:
-            current.append(w)
-    if current:
-        chunks.append(" ".join(current))
-    return chunks
-
 
 @server.rtc_session()
 async def my_agent(ctx: agents.JobContext):
@@ -134,7 +136,7 @@ async def my_agent(ctx: agents.JobContext):
         tts="elevenlabs/eleven_turbo_v2_5:cgSgspJ2msm6clMCkdW9",
         vad=silero.VAD.load(),
         turn_detection=MultilingualModel(),
-        allow_interruptions=True,
+        allow_interruptions=True,   # ✅ THIS IS THE KEY FIX
     )
 
     await session.start(
@@ -152,37 +154,16 @@ async def my_agent(ctx: agents.JobContext):
         ),
     )
 
-    # Initial greeting
-    await session.generate_reply(
+    # Initial greeting (NO asyncio.create_task)
+    session.generate_reply(
         instructions=(
-            "Hello sir 😊 I am here to help you. "
-            "You can ask general questions or upload documents "
-            "like PDF, TXT, DOC, or DOCX."
+            "Hello sir, I am here to help you 😊 "
+            "You can ask me any general questions, "
+            "or I can help you work with files such as PDF, TXT, DOC, or DOCX. "
+            "Please let me know how I can assist you today."
         )
     )
 
-    # Watchdog (simple text-only for version safety)
-    async def watchdog():
-        while True:
-            await asyncio.sleep(10)
-            await session.generate_reply(instructions="I am listening. Please continue.")
-
-    asyncio.create_task(watchdog())
-
-    # Override session TTS to chunk long text
-    original_generate_reply = session.generate_reply
-
-    async def safe_generate_reply(*args, **kwargs):
-        # Get the instructions text
-        text = kwargs.get("instructions", "")
-        if len(text) > 400:
-            chunks = chunk_text(text, max_chars=400)
-            for c in chunks:
-                await original_generate_reply(instructions=c)
-        else:
-            await original_generate_reply(*args, **kwargs)
-
-    session.generate_reply = safe_generate_reply  # monkey-patch
 
 
 if __name__ == "__main__":
